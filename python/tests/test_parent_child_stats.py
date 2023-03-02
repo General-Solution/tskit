@@ -10,6 +10,7 @@ import test_tree_stats as tts
 from functools import partial
 from time import time
 from tqdm import tqdm
+import itertools
 
 def naive_node_parent_child_stat(
     ts, W, f, windows=None, polarised=False, span_normalise=True
@@ -329,6 +330,77 @@ def node_parent_child_stat_4(ts, sample_weights, summary_func, windows=None, pol
             result[j] /= windows[j + 1] - windows[j]
     return result
 
+def node_parent_child_stat_5(ts, sample_weights, summary_func, windows=None, polarised=False, span_normalise=True):
+    '''
+    Within a tree, for each parent node, computes a statistic of the form:
+    summary_function(weights(parent),[weights(child)for each child of parent])
+    '''
+
+    n, state_dim = sample_weights.shape
+    windows = ts.parse_windows(windows)
+    num_windows = windows.shape[0] - 1
+    result_dim = summary_func(sample_weights[0], [sample_weights[0]]).shape[0]
+    result = np.zeros((num_windows, ts.num_nodes, result_dim))
+    state = np.zeros((ts.num_nodes, state_dim))
+    state[ts.samples()] = sample_weights
+    total_weight = np.sum(sample_weights, axis=0)
+
+    def node_summary(Wparent, Wchildren):
+        s = summary_func(Wparent, Wchildren)
+        if not polarised:
+            s += summary_func(total_weight - Wparent, total_weight - Wchildren)
+        return s
+
+    window_index = 0
+    parent = np.zeros(ts.num_nodes, dtype=np.int32) - 1
+    children = [[] for i in range(ts.num_nodes)]
+    # contains summary_func(state[u]) for each node
+    current_values = np.zeros((ts.num_nodes, result_dim))
+    # contains the location of the last time we updated the output for a node.
+    last_update = np.zeros((ts.num_nodes, 1))
+    for ((t_left, t_right), edges_out, edges_in), tree in zip(ts.edge_diffs(), ts.trees()):
+        for edge in edges_out:
+            u = edge.child
+            v = edge.parent
+            parent[u] = -1
+            children[v].remove(u)
+            while v != -1:
+                result[window_index, v] += (t_left - last_update[v]) * current_values[v]
+                last_update[v] = t_left
+                state[v] -= state[u]
+                current_values[v] = node_summary(state[v], [state[child] for child in children[v]])
+                v = parent[v]
+
+        for edge in edges_in:
+            u = edge.child
+            v = edge.parent
+            parent[u] = v
+            children[v].append(u)
+            while v != -1:
+                result[window_index, v] += (t_left - last_update[v]) * current_values[v]
+                last_update[v] = t_left
+                state[v] += state[u]
+                current_values[v] = node_summary(state[v], [state[child] for child in children[v]])
+                v = parent[v]
+
+        # Update the windows 
+        while window_index < num_windows and windows[window_index + 1] <= t_right:
+            w_right = windows[window_index + 1]
+            # Flush the contribution of all nodes to the current window.
+            for u in range(ts.num_nodes):
+                result[window_index, u] += (w_right - last_update[u]) * current_values[
+                    u
+                ]
+                last_update[u] = w_right
+            window_index += 1
+
+    assert window_index == windows.shape[0] - 1
+    if span_normalise:
+        for j in range(num_windows):
+            result[j] /= windows[j + 1] - windows[j]
+    return result
+    
+
 def node_parent_child_stat(ts, sample_weights, summary_func, windows=None, polarised=False, span_normalise=True):
     return node_parent_child_stat_3(ts, sample_weights, summary_func, windows=windows, polarised=polarised, span_normalise=span_normalise   )
 
@@ -391,7 +463,7 @@ def test_parent_child_stat(verification = verify_pc_contributions, num_samples =
 
 def benchmark_pc_algorithms(methods):
     times = np.zeros(len(methods))
-    reps = msprime.sim_ancestry(100, recombination_rate=0.01, sequence_length=10000, num_replicates=10)
+    reps = msprime.sim_ancestry(1000, recombination_rate=0.1, sequence_length=10000, num_replicates=10)
     for ts in tqdm(reps):
         weights = np.ones((ts.num_samples,1))
         for method_num, method in enumerate(methods):
@@ -413,6 +485,20 @@ def run_all_pc_tests():
     test_parent_child_stat(verification=verify_pc_algorithms_equal(node_parent_child_stat_2, pc_f, node_parent_child_stat, pc_f), num_samples=num_samples, recombination_rate=recombination_rate, sequence_length=sequence_length)
     print('All tests ran successfully.')
 
+def run_tests_v5():
+    num_samples=2
+    sequence_length=3
+    recombination_rate=1
+    pc_f1 = lambda parent, child: child
+    pc_f2 = lambda parent, child: child*(parent-child)*0.5
+    pc5_f1 = lambda Wparent, Wchildren: sum(Wchild for Wchild in Wchildren)
+    pc5_f2 = lambda Wparent, Wchildren: sum(Wchild*(Wparent-Wchild) for Wchild in Wchildren)*0.5
+    pc5_f3 = lambda Wparent, Wchildren: np.array([sum(pair[0]*pair[1] for pair in itertools.combinations(Wchildren, 2))])
+    test_parent_child_stat(verification=verify_pc_algorithms_equal(node_parent_child_stat_2, pc_f1, node_parent_child_stat_5, pc5_f1), num_samples=num_samples, recombination_rate=recombination_rate, sequence_length=sequence_length)
+    test_parent_child_stat(verification=verify_pc_algorithms_equal(node_parent_child_stat_2, pc_f2, node_parent_child_stat_5, pc5_f2), num_samples=num_samples, recombination_rate=recombination_rate, sequence_length=sequence_length)
+    test_parent_child_stat(verification=verify_pc_algorithms_equal(node_parent_child_stat_2, pc_f2, node_parent_child_stat_5, pc5_f3), num_samples=num_samples, recombination_rate=recombination_rate, sequence_length=sequence_length)
+    print('All tests ran successfully.')
+
 def run_visual_test():
     ts = msprime.sim_ancestry(2, recombination_rate=0, sequence_length=1)
     weights = np.ones((ts.num_samples,1))
@@ -420,16 +506,29 @@ def run_visual_test():
     node_parent_child_stat(ts, weights, pc_f, polarised=True)
     print(ts.draw_text())
 
+def run_visual_test_v5():
+    ts = msprime.sim_ancestry(2, recombination_rate=0, sequence_length=1)
+    f = lambda parent: parent
+    pc5_f1 = lambda Wparent, Wchildren: sum(Wchild for Wchild in Wchildren)
+    weights = np.ones((ts.num_samples,1))
+    contributions = tts.node_general_stat(ts, weights, f, polarised=True)
+    coalescences = node_parent_child_stat_5(ts, weights, pc5_f1, polarised=True)
+    print(ts.draw_text())
+    print(contributions, coalescences)
+
 def methods_to_benchmark():
     pc_f = lambda parent, child: child*(parent-child)
     f = lambda x: x
+    pc5_f = lambda Wparent, Wchildren: sum(Wchild*(Wparent-Wchild) for Wchild in Wchildren)*0.5
     return [
         #lambda ts, weights: naive_node_parent_child_stat(ts, weights, pc_f, polarised=True),
         lambda ts, weights: tts.node_general_stat(ts, weights, f, polarised=True),
         lambda ts, weights: node_parent_child_stat_2(ts, weights, pc_f, polarised=True),
-        lambda ts, weights: node_parent_child_stat_5(ts, weights, pc_f, polarised=True),
+        lambda ts, weights: node_parent_child_stat_5(ts, weights, pc5_f, polarised=True),
     ]
 
-run_all_pc_tests()
+#run_all_pc_tests()
 #run_visual_test()
-#benchmark_pc_algorithms(methods_to_benchmark())
+benchmark_pc_algorithms(methods_to_benchmark())
+#run_tests_v5()
+
