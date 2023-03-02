@@ -2,7 +2,6 @@
 import msprime
 import io
 import textwrap
-import pedigree_tools
 import tskit
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,43 +10,6 @@ import test_tree_stats as tts
 from functools import partial
 from time import time
 from tqdm import tqdm
-
-def parse_indented(text: str, demography: msprime.Demography=None):
-    return msprime.parse_pedigree(
-        io.StringIO(textwrap.dedent(text)), demography=demography
-    )
-
-def windowed_tree_stat(ts, stat, windows, span_normalise=True):
-    shape = list(stat.shape)
-    shape[0] = len(windows) - 1
-    A = np.zeros(shape)
-
-    tree_breakpoints = np.array(list(ts.breakpoints()))
-    tree_index = 0
-    for j in range(len(windows) - 1):
-        w_left = windows[j]
-        w_right = windows[j + 1]
-        while True:
-            t_left = tree_breakpoints[tree_index]
-            t_right = tree_breakpoints[tree_index + 1]
-            left = max(t_left, w_left)
-            right = min(t_right, w_right)
-            weight = max(0.0, (right - left) / (t_right - t_left))
-            A[j] += stat[tree_index] * weight
-            assert left != right
-            if t_right <= w_right:
-                tree_index += 1
-                # TODO This is inelegant - should include this in the case below
-                if t_right == w_right:
-                    break
-            else:
-                break
-    if span_normalise:
-        # re-normalize by window lengths
-        window_lengths = np.diff(windows)
-        for j in range(len(windows) - 1):
-            A[j] /= window_lengths[j]
-    return A
 
 def naive_node_parent_child_stat(
     ts, W, f, windows=None, polarised=False, span_normalise=True
@@ -70,7 +32,7 @@ def naive_node_parent_child_stat(
                 if not polarised:
                     s[u] += f(total - X[u], total - X[v])
         sigma[tree.index] = s * tree.span
-    return windowed_tree_stat(ts, sigma, windows, span_normalise=span_normalise)
+    return tts.windowed_tree_stat(ts, sigma, windows, span_normalise=span_normalise)
 
 def node_parent_child_stat_1(ts, sample_weights, summary_func, windows=None, polarised=False, span_normalise=True):
     '''
@@ -250,7 +212,7 @@ def node_parent_child_stat_3(ts, sample_weights, summary_func, windows=None, pol
     for u in range(ts.num_nodes):
         current_values[u] = node_summary(u, parent)
     # contains the location of the last time we updated the output for a node.
-    last_update = np.zeros((ts.num_nodes, 1))
+    last_update = np.zeros(ts.num_nodes)
     for ((t_left, t_right), edges_out, edges_in), tree in zip(ts.edge_diffs(), ts.trees()):
         for edge in edges_out:
             u = edge.child
@@ -272,7 +234,7 @@ def node_parent_child_stat_3(ts, sample_weights, summary_func, windows=None, pol
                 state[v] += state[u]
                 v = parent[v]
 
-        for v in tree.nodes():
+        for v in range(ts.num_nodes):
             if last_update[v] == t_left:
                 current_values[v] = node_summary(v, tree.children(v))
 
@@ -368,7 +330,7 @@ def node_parent_child_stat_4(ts, sample_weights, summary_func, windows=None, pol
     return result
 
 def node_parent_child_stat(ts, sample_weights, summary_func, windows=None, polarised=False, span_normalise=True):
-    return node_parent_child_stat_4(ts, sample_weights, summary_func, windows=None, polarised=False, span_normalise=True)
+    return node_parent_child_stat_3(ts, sample_weights, summary_func, windows=windows, polarised=polarised, span_normalise=span_normalise   )
 
 def verify_pc_contributions(ts):
     '''
@@ -442,13 +404,13 @@ def benchmark_pc_algorithms(methods):
 
 def run_all_pc_tests():
     num_samples=2
-    sequence_length=1
-    recombination_rate=0
+    sequence_length=3
+    recombination_rate=1
     test_parent_child_stat(num_samples=num_samples, recombination_rate=recombination_rate, sequence_length=sequence_length)
-    test_parent_child_stat(verification=verify_pc_unary, num_samples=num_samples, recombination_rate=0.01, sequence_length=sequence_length, record_unary=True)
+    test_parent_child_stat(verification=verify_pc_unary, num_samples=num_samples, recombination_rate=recombination_rate, sequence_length=sequence_length, record_unary=True)
     pc_f = lambda parent, child: child*(parent-child)
-    #test_parent_child_stat(verification=verify_pc_algorithms_equal(naive_node_parent_child_stat, pc_f, node_parent_child_stat_4, pc_f), num_samples=num_samples, recombination_rate=recombination_rate, sequence_length=sequence_length)
-    test_parent_child_stat(verification=verify_pc_algorithms_equal(node_parent_child_stat_2, pc_f, node_parent_child_stat_4, pc_f), num_samples=num_samples, recombination_rate=recombination_rate, sequence_length=sequence_length)
+    #test_parent_child_stat(verification=verify_pc_algorithms_equal(naive_node_parent_child_stat, pc_f, node_parent_child_stat, pc_f), num_samples=num_samples, recombination_rate=recombination_rate, sequence_length=sequence_length)
+    test_parent_child_stat(verification=verify_pc_algorithms_equal(node_parent_child_stat_2, pc_f, node_parent_child_stat, pc_f), num_samples=num_samples, recombination_rate=recombination_rate, sequence_length=sequence_length)
     print('All tests ran successfully.')
 
 def run_visual_test():
@@ -465,7 +427,7 @@ def methods_to_benchmark():
         #lambda ts, weights: naive_node_parent_child_stat(ts, weights, pc_f, polarised=True),
         lambda ts, weights: tts.node_general_stat(ts, weights, f, polarised=True),
         lambda ts, weights: node_parent_child_stat_2(ts, weights, pc_f, polarised=True),
-        lambda ts, weights: node_parent_child_stat_4(ts, weights, pc_f, polarised=True),
+        lambda ts, weights: node_parent_child_stat_5(ts, weights, pc_f, polarised=True),
     ]
 
 run_all_pc_tests()
